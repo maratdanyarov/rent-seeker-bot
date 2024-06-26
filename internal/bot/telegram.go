@@ -7,27 +7,17 @@ import (
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"log"
 	"os"
+	"rent_seekerbot/internal/database"
 	"rent_seekerbot/internal/real_estate_api"
 	"strconv"
 	"strings"
-	"sync"
 )
 
 var (
-	bot           *tgbotapi.BotAPI
-	userDataMap   = make(map[int64]*UserData)
-	userDataMutex sync.Mutex
-	zooplaClient  *real_estate_api.ZooplaClient
+	bot          *tgbotapi.BotAPI
+	zooplaClient *real_estate_api.ZooplaClient
+	db           *database.DB
 )
-
-type UserData struct {
-	State      string
-	ProperType string
-	PriceRange string
-	Bedrooms   string
-	Furnished  string
-	Area       string
-}
 
 const (
 	stateAwaitingPriceRange   = "awaiting_price_range"
@@ -37,7 +27,7 @@ const (
 )
 
 // StartBot initializes and starts the Telegram bot.
-func StartBot(token string, zClient *real_estate_api.ZooplaClient) error {
+func StartBot(token string, zClient *real_estate_api.ZooplaClient, database *database.DB) error {
 	var err error
 	bot, err = tgbotapi.NewBotAPI(token)
 	if err != nil {
@@ -48,7 +38,7 @@ func StartBot(token string, zClient *real_estate_api.ZooplaClient) error {
 	if zooplaClient == nil {
 		return fmt.Errorf("zooplaClient is nil")
 	}
-
+	db = database
 	// Set this to true to log all interactions with telegram servers
 	bot.Debug = false
 
@@ -106,16 +96,8 @@ func handleUpdate(update tgbotapi.Update) {
 	}
 }
 
-func getUserData(chatID int64) *UserData {
-	userDataMutex.Lock()
-	defer userDataMutex.Unlock()
-
-	userData, exists := userDataMap[chatID]
-	if !exists {
-		userData = &UserData{}
-		userDataMap[chatID] = userData
-	}
-	return userData
+func getUserData(chatID int64) (*database.UserData, error) {
+	return db.GetUser(chatID)
 }
 
 // handleMessage processes incoming messages.
@@ -132,7 +114,12 @@ func handleMessage(message *tgbotapi.Message) {
 
 	var err error
 
-	userData := getUserData(message.Chat.ID)
+	userData, err := getUserData(message.Chat.ID)
+	if err != nil {
+		log.Printf("Error getting user data (handleMessage func): %v", err)
+		sendMessage(message.Chat.ID, "Sorry, an error occurred. Please try again.")
+		return
+	}
 
 	if strings.HasPrefix(text, "/") {
 		handleCommand(message.Chat.ID, text)
@@ -160,6 +147,12 @@ func handleMessage(message *tgbotapi.Message) {
 	if err != nil {
 		log.Printf("An error occured: %s", err.Error())
 	}
+
+	err = db.SaveUser(message.Chat.ID, userData.State, userData.PropertyType, userData.PriceRange,
+		userData.Bedrooms, userData.Furnished, userData.Area)
+	if err != nil {
+		log.Printf("Error saving user data: %v", err)
+	}
 }
 
 // handleCommand processes bot commands.
@@ -168,7 +161,11 @@ func handleCommand(chatId int64, command string) error {
 
 	switch command {
 	case "/start":
-		userData := getUserData(chatId)
+		userData, err := getUserData(chatId)
+		if err != nil {
+			log.Printf("Error getting user data (handleMessage func): %v", err)
+			sendMessage(chatId, "Sorry, an error occurred. Please try again.")
+		}
 		userData.State = ""
 		msg := tgbotapi.NewMessage(chatId, welcomeMessage)
 		msg.ReplyMarkup = goButton
@@ -186,12 +183,17 @@ func handleCommand(chatId int64, command string) error {
 
 // handleButton proceses callback queries from inline buttons.
 func handleButton(query *tgbotapi.CallbackQuery) {
-	userData := getUserData(query.Message.Chat.ID)
+	userData, err := getUserData(query.Message.Chat.ID)
+	if err != nil {
+		log.Printf("Error getting user data (handleMessage func): %v", err)
+		sendMessage(query.Message.Chat.ID, "Sorry, an error occurred. Please try again.")
+		return
+	}
 	switch query.Data {
 	case goButtonText:
 		sendMessageWithMarkup(query.Message.Chat.ID, selectPropertyMessage, selectProperty)
 	case flatButtonText, houseButtonText:
-		userData.ProperType = query.Data
+		userData.PropertyType = query.Data
 		userData.State = stateAwaitingPriceRange
 		sendMessage(query.Message.Chat.ID, priceRangeMessage)
 	case studioButtonText, oneBedButtonText, twoBedButtonText, threeBedButtonText, fourBedButtonText, fiveBedButtonText:
@@ -207,7 +209,7 @@ func handleButton(query *tgbotapi.CallbackQuery) {
 	bot.Send(tgbotapi.NewCallback(query.ID, ""))
 }
 
-func searchProperties(chatID int64, userData *UserData) {
+func searchProperties(chatID int64, userData *database.UserData) {
 	if zooplaClient == nil {
 		log.Println("Error: zooplaClient is nil")
 		sendMessage(chatID, "Sorry, I encountered an error while searching for properties. Please try again later.")
@@ -224,7 +226,7 @@ func searchProperties(chatID int64, userData *UserData) {
 		sendMessage(chatID, "I'm sorry, I couldn't understand the number of bedrooms. Please try again.")
 		return
 	}
-	properties, err := zooplaClient.SearchProperties(userData.Area, minPrice, maxPrice, bedrooms, userData.ProperType)
+	properties, err := zooplaClient.SearchProperties(userData.Area, minPrice, maxPrice, bedrooms, userData.PropertyType)
 	if err != nil {
 		log.Printf("Error searching properties: %v", err)
 		sendMessage(chatID, "Sorry, I encountered an error while searching for properties. Please try again later.")
