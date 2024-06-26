@@ -40,3 +40,4 @@ go.sum
 go.mod
 
 Makefile
+rent_seeker.db

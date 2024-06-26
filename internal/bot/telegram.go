@@ -15,7 +15,7 @@ import (
 
 var (
 	bot          *tgbotapi.BotAPI
-	zooplaClient *real_estate_api.ZooplaClient
+	zooplaClient real_estate_api.ZooplaClientInterface
 	db           *database.DB
 )
 
@@ -27,7 +27,7 @@ const (
 )
 
 // StartBot initializes and starts the Telegram bot.
-func StartBot(token string, zClient *real_estate_api.ZooplaClient, database *database.DB) error {
+func StartBot(token string, zClient real_estate_api.ZooplaClientInterface, database *database.DB) error {
 	var err error
 	bot, err = tgbotapi.NewBotAPI(token)
 	if err != nil {
@@ -97,13 +97,26 @@ func handleUpdate(update tgbotapi.Update) {
 }
 
 func getUserData(chatID int64) (*database.UserData, error) {
-	return db.GetUser(chatID)
+	userData, err := db.GetUser(chatID)
+	if err != nil {
+		return nil, err
+	}
+	if userData == nil {
+		// User doesn't exist, create a new one
+		userData = &database.UserData{State: ""}
+		err = db.SaveUser(chatID, "", "", "", "", "", "")
+		if err != nil {
+			return nil, err
+		}
+	}
+	return userData, nil
 }
 
 // handleMessage processes incoming messages.
 func handleMessage(message *tgbotapi.Message) {
 	user := message.From
 	text := message.Text
+	chatID := message.Chat.ID
 
 	if user == nil {
 		return
@@ -114,11 +127,15 @@ func handleMessage(message *tgbotapi.Message) {
 
 	var err error
 
-	userData, err := getUserData(message.Chat.ID)
+	userData, err := getUserData(chatID)
 	if err != nil {
 		log.Printf("Error getting user data (handleMessage func): %v", err)
 		sendMessage(message.Chat.ID, "Sorry, an error occurred. Please try again.")
 		return
+	}
+
+	if userData == nil {
+		userData = &database.UserData{State: ""}
 	}
 
 	if strings.HasPrefix(text, "/") {
@@ -163,10 +180,27 @@ func handleCommand(chatId int64, command string) error {
 	case "/start":
 		userData, err := getUserData(chatId)
 		if err != nil {
-			log.Printf("Error getting user data (handleMessage func): %v", err)
+			log.Printf("Error getting user data: %v", err)
 			sendMessage(chatId, "Sorry, an error occurred. Please try again.")
+			return err
+		}
+		if userData == nil {
+			userData = &database.UserData{State: ""}
+			err = db.SaveUser(chatId, userData.State, "", "", "", "", "")
+			if err != nil {
+				log.Printf("Error saving new user: %v", err)
+				sendMessage(chatId, "Sorry, an error occurred. Please try again.")
+				return err
+			}
 		}
 		userData.State = ""
+		err = db.SaveUser(chatId, userData.State, userData.PropertyType, userData.PriceRange,
+			userData.Bedrooms, userData.Furnished, userData.Area)
+		if err != nil {
+			log.Printf("Error updating user state: %v", err)
+			sendMessage(chatId, "Sorry, an error occurred. Please try again.")
+			return err
+		}
 		msg := tgbotapi.NewMessage(chatId, welcomeMessage)
 		msg.ReplyMarkup = goButton
 		_, err = bot.Send(msg)
@@ -174,11 +208,47 @@ func handleCommand(chatId int64, command string) error {
 		msg := tgbotapi.NewMessage(chatId, "Hello! I’m here to assist you in finding your perfect home.")
 		_, err = bot.Send(msg)
 	// ADD MENU OPTION LATER
+	case "/preferences":
+		err = showUserPreferences(chatId)
 	default:
 		sendMessage(chatId, "I’m sorry, but I don’t recognize this command. Please type /help to see the available list of commands.")
 	}
 
 	return err
+}
+
+func showUserPreferences(chatId int64) error {
+	userData, err := getUserData(chatId)
+	if err != nil {
+		log.Printf("Error getting user data: %v", err)
+		sendMessage(chatId, "Sorry, an error occurred while retrieving your preferences. Please try again.")
+		return err
+	}
+
+	if userData == nil || (userData.PropertyType == "" && userData.PriceRange == "" && userData.Bedrooms == "" && userData.Furnished == "" && userData.Area == "") {
+		sendMessage(chatId, "You don't have any saved preferences yet. Start a new search to set your preferences!")
+		return nil
+	}
+
+	preferencesMsg := "Your saved preferences:\n\n"
+	if userData.PropertyType != "" {
+		preferencesMsg += fmt.Sprintf("Property Type: %s\n", userData.PropertyType)
+	}
+	if userData.PriceRange != "" {
+		preferencesMsg += fmt.Sprintf("Price Range: %s\n", userData.PriceRange)
+	}
+	if userData.Bedrooms != "" {
+		preferencesMsg += fmt.Sprintf("Bedrooms: %s\n", userData.Bedrooms)
+	}
+	if userData.Furnished != "" {
+		preferencesMsg += fmt.Sprintf("Furnished: %s\n", userData.Furnished)
+	}
+	if userData.Area != "" {
+		preferencesMsg += fmt.Sprintf("Area: %s\n", userData.Area)
+	}
+
+	sendMessage(chatId, preferencesMsg)
+	return nil
 }
 
 // handleButton proceses callback queries from inline buttons.
@@ -204,6 +274,12 @@ func handleButton(query *tgbotapi.CallbackQuery) {
 		userData.Furnished = query.Data
 		userData.State = stateSelectingArea
 		sendMessage(query.Message.Chat.ID, selectArea)
+	}
+
+	err = db.SaveUser(query.Message.Chat.ID, userData.State, userData.PropertyType, userData.PriceRange,
+		userData.Bedrooms, userData.Furnished, userData.Area)
+	if err != nil {
+		log.Printf("Error saving user data: %v", err)
 	}
 
 	bot.Send(tgbotapi.NewCallback(query.ID, ""))
